@@ -1,0 +1,215 @@
+--[[
+    Secure Executor Bootstrap v3.0
+    ================================
+    HOST THIS FILE ON GITHUB (raw URL). It contains NO secrets.
+
+    HOW TO USE (in your executor):
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/YOU/REPO/main/lua/bootstrap.lua"))("sk_your_personal_key")
+
+    Each user gets their own personal API key from the admin dashboard.
+    If a key is leaked or abused, the admin deactivates that single key —
+    everyone else is unaffected.
+
+    Only fill in API_BASE below (your Replit domain — not a secret).
+]]
+
+local API_BASE        = "https://secure-modular-system--sircandysup.replit.app/api"
+local LOADER_VERSION  = "1.0.0"
+local HEARTBEAT_EVERY = 30  -- seconds between heartbeat pings
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  KEY VALIDATION
+--  Received as a function argument, never stored in this file.
+-- ─────────────────────────────────────────────────────────────────────────────
+local API_KEY = ...
+
+if type(API_KEY) ~= "string" or #API_KEY < 10 then
+    error(
+        "[Loader] No API key provided.\n" ..
+        "Usage: loadstring(game:HttpGet(\"...\"))(\"sk_your_personal_key\")\n" ..
+        "Get your key from the admin dashboard.",
+        0
+    )
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  EXECUTOR HTTP  (Synapse X, KRNL, Fluxus, Arceus X, Delta, etc.)
+-- ─────────────────────────────────────────────────────────────────────────────
+local HS = game:GetService("HttpService")
+
+local function execRequest(options)
+    if syn and syn.request then
+        return syn.request(options)
+    elseif request then
+        return request(options)
+    elseif http and http.request then
+        return http.request(options)
+    else
+        error("[Loader] No HTTP library found — executor not supported", 0)
+    end
+end
+
+local function httpPost(url, body)
+    local response = execRequest({
+        Url     = url,
+        Method  = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body    = HS:JSONEncode(body),
+    })
+    if not response or not response.Body then
+        return false, "empty response"
+    end
+    return pcall(HS.JSONDecode, HS, response.Body)
+end
+
+local function httpGet(url, token)
+    local response = execRequest({
+        Url     = url,
+        Method  = "GET",
+        Headers = {
+            ["Content-Type"]  = "application/json",
+            ["Authorization"] = "Bearer " .. token,
+        },
+    })
+    if not response or not response.Body then
+        return false, "empty response"
+    end
+    return pcall(HS.JSONDecode, HS, response.Body)
+end
+
+local function authPost(url, token, body)
+    local response = execRequest({
+        Url     = url,
+        Method  = "POST",
+        Headers = {
+            ["Content-Type"]  = "application/json",
+            ["Authorization"] = "Bearer " .. token,
+        },
+        Body    = HS:JSONEncode(body or {}),
+    })
+    if not response or not response.Body then return false, nil end
+    return pcall(HS.JSONDecode, HS, response.Body)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  HWID  — unique per player, consistent, never user-controlled
+-- ─────────────────────────────────────────────────────────────────────────────
+local function getHWID()
+    local player = game:GetService("Players").LocalPlayer
+    -- Some executors expose getHWID() natively (more unique)
+    if type(getHWID) == "function" then
+        local ok, h = pcall(getHWID)
+        if ok and type(h) == "string" and #h > 4 then
+            return "rbx_hw_" .. h:sub(1, 32)
+        end
+    end
+    -- Fallback: userId + first 8 chars of jobId
+    return string.format("rbx_%d_%s", player.UserId, game.JobId:sub(1, 8))
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  MAIN LOADER
+-- ─────────────────────────────────────────────────────────────────────────────
+local function load()
+    local Players = game:GetService("Players")
+    local hwid    = getHWID()
+    local startTime = tick()
+
+    -- 1. Authenticate ──────────────────────────────────────────────────────────
+    local authOk, authData = httpPost(API_BASE .. "/auth-session", {
+        hwid   = hwid,
+        apiKey = API_KEY,
+    })
+
+    if not authOk or type(authData) ~= "table" or not authData.token then
+        local reason = type(authData) == "table" and authData.error or tostring(authData)
+        error("[Loader] Auth failed: " .. reason, 0)
+    end
+
+    local token = authData.token
+    print("[Loader] Authenticated. Fetching payload...")
+
+    -- 2. Fetch payload ─────────────────────────────────────────────────────────
+    local payloadOk, payload = httpGet(
+        API_BASE .. "/get-payload?loader_version=" .. LOADER_VERSION,
+        token
+    )
+
+    if not payloadOk or type(payload) ~= "table" or not payload.script then
+        local reason = type(payload) == "table" and payload.error or tostring(payload)
+        authPost(API_BASE .. "/end-session", token)
+        error("[Loader] Payload fetch failed: " .. reason, 0)
+    end
+
+    local moduleName = payload.moduleName or "core"
+    print(string.format("[Loader] Loaded: %s v%s", moduleName, tostring(payload.version)))
+
+    -- 3. Compile ───────────────────────────────────────────────────────────────
+    local scriptFn, loadErr = loadstring(payload.script, "@" .. moduleName)
+    if not scriptFn then
+        authPost(API_BASE .. "/analytics", token, {
+            module        = moduleName,
+            loaderVersion = LOADER_VERSION,
+            runtime       = tick() - startTime,
+            success       = false,
+            errorMessage  = "loadstring: " .. tostring(loadErr),
+        })
+        authPost(API_BASE .. "/end-session", token)
+        error("[Loader] Compile error: " .. tostring(loadErr), 0)
+    end
+
+    -- 4. Heartbeat (background task) ───────────────────────────────────────────
+    --    Stops automatically if the server rejects the session (client blocked)
+    local alive = true
+    task.spawn(function()
+        while alive do
+            task.wait(HEARTBEAT_EVERY)
+            if not alive then break end
+            local ok, resp = authPost(API_BASE .. "/heartbeat", token)
+            if not ok or (type(resp) == "table" and resp.error) then
+                alive = false
+                warn("[Loader] Session terminated by server.")
+            end
+        end
+    end)
+
+    -- End session cleanly when the player leaves the game
+    Players.LocalPlayer.AncestryChanged:Connect(function()
+        alive = false
+        pcall(authPost, API_BASE .. "/end-session", token)
+    end)
+
+    -- 5. Inject context and execute ────────────────────────────────────────────
+    --    _CTX is available inside the script if it ever wants to call the backend.
+    --    The ESP script works perfectly without ever touching _CTX.
+    local _CTX = {
+        hwid          = hwid,
+        token         = token,
+        moduleName    = moduleName,
+        loaderVersion = LOADER_VERSION,
+        post          = function(_, endpoint, body) return authPost(API_BASE .. endpoint, token, body) end,
+        get           = function(_, endpoint)       return httpGet(API_BASE .. endpoint, token) end,
+    }
+
+    setfenv(scriptFn, setmetatable({ _CTX = _CTX }, { __index = getfenv(0) }))
+
+    local runOk, runErr = pcall(scriptFn)
+    local runtime = tick() - startTime
+
+    -- 6. Report analytics ──────────────────────────────────────────────────────
+    pcall(authPost, API_BASE .. "/analytics", token, {
+        module        = moduleName,
+        loaderVersion = LOADER_VERSION,
+        runtime       = runtime,
+        success       = runOk,
+        errorMessage  = runOk and nil or tostring(runErr),
+    })
+
+    if not runOk then
+        alive = false
+        warn("[Loader] Script error: " .. tostring(runErr))
+        authPost(API_BASE .. "/end-session", token)
+    end
+end
+
+pcall(load)
