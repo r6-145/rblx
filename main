@@ -94,16 +94,21 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 --  HWID  — unique per player, consistent, never user-controlled
 -- ─────────────────────────────────────────────────────────────────────────────
-local function getHWID()
+
+-- Capture the executor's native getHWID global BEFORE we define any local with
+-- a similar name, so there is no risk of shadowing / infinite recursion.
+local _executorGetHWID = (type(getHWID) == "function") and getHWID or nil
+
+local function buildHWID()
     local player = game:GetService("Players").LocalPlayer
-    -- Some executors expose getHWID() natively (more unique)
-    if type(getHWID) == "function" then
-        local ok, h = pcall(getHWID)
+    -- Use executor's native getHWID if available (more hardware-unique)
+    if _executorGetHWID then
+        local ok, h = pcall(_executorGetHWID)
         if ok and type(h) == "string" and #h > 4 then
-            return "rbx_hw_" .. h:sub(1, 32)
+            return "hw_" .. h:sub(1, 32)
         end
     end
-    -- Fallback: userId + first 8 chars of jobId
+    -- Fallback: stable per-player identifier from userId + jobId prefix
     return string.format("rbx_%d_%s", player.UserId, game.JobId:sub(1, 8))
 end
 
@@ -112,7 +117,7 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 local function load()
     local Players = game:GetService("Players")
-    local hwid    = getHWID()
+    local hwid    = buildHWID()
     local startTime = tick()
 
     -- 1. Authenticate ──────────────────────────────────────────────────────────
@@ -180,9 +185,10 @@ local function load()
     end)
 
     -- 5. Inject context and execute ────────────────────────────────────────────
-    --    _CTX is available inside the script if it ever wants to call the backend.
-    --    The ESP script works perfectly without ever touching _CTX.
-    local _CTX = {
+    --    _CTX is placed into _G so the script runs in the FULL executor environment.
+    --    setfenv is intentionally avoided — it breaks Drawing API and other
+    --    executor-injected globals on several executors.
+    _G._CTX = {
         hwid          = hwid,
         token         = token,
         moduleName    = moduleName,
@@ -190,8 +196,6 @@ local function load()
         post          = function(_, endpoint, body) return authPost(API_BASE .. endpoint, token, body) end,
         get           = function(_, endpoint)       return httpGet(API_BASE .. endpoint, token) end,
     }
-
-    setfenv(scriptFn, setmetatable({ _CTX = _CTX }, { __index = getfenv(0) }))
 
     local runOk, runErr = pcall(scriptFn)
     local runtime = tick() - startTime
